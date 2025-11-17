@@ -4,410 +4,474 @@ import sqlite3
 import matplotlib.pyplot as plt
 import seaborn as sns
 from transformers import pipeline
-from rapidfuzz import process as fz
 import re
 from datetime import date, timedelta
 
-st.set_page_config(page_title="NL Healthcare Analytics", layout="wide")
-st.title("🧠 Natural Language Healthcare Data Assistant")
+st.set_page_config(page_title="Natural Language Healthcare Analytics", layout="wide")
+st.title("Natural Language Healthcare Data Assistant")
 
-# =============================================================================
-# FILE UPLOAD
-# =============================================================================
+# =====================================================================
+# DATA LOADING
+# =====================================================================
 
-uploaded_file = st.file_uploader("📂 Upload your dataset (CSV)", type=["csv"])
-
+uploaded_file = st.file_uploader("Upload your dataset (CSV)", type=["csv"])
 if not uploaded_file:
     st.stop()
 
 df = pd.read_csv(uploaded_file)
 
-# Convert numeric-suspicious columns
+# convert likely numeric columns
 for c in df.columns:
     clean = df[c].astype(str).str.replace(r"[,$ ]", "", regex=True)
     if clean.str.fullmatch(r"-?\d+(\.\d+)?").mean() > 0.7:
         df[c] = pd.to_numeric(clean, errors="coerce")
 
+# in-memory SQL
 conn = sqlite3.connect(":memory:")
 df.to_sql("data", conn, index=False, if_exists="replace")
 
-st.success(f"✅ Loaded {df.shape[0]} rows, {df.shape[1]} columns")
+st.write(f"Loaded {df.shape[0]} rows and {df.shape[1]} columns")
 st.dataframe(df.head())
 
-# =============================================================================
-# LOAD INTENT MODEL
-# =============================================================================
+# =====================================================================
+# INTENT MODEL
+# =====================================================================
 
 try:
     clf = pipeline("text-classification", model="intent_model", tokenizer="intent_model")
 except Exception as e:
-    st.error("❌ Could not load intent_model folder. Place it next to app.py.")
+    st.error(f"Could not load intent_model. Error: {e}")
     st.stop()
 
 
-# =============================================================================
-# COLUMN EXTRACTION
-# =============================================================================
-
-def extract_columns(q):
-    q = q.lower()
-    cols = df.columns.tolist()
-
-    # 1. word match
-    words = re.findall(r"[a-zA-Z]+", q)
-    exact = [c for c in cols if c.lower() in words]
-    if exact:
-        return exact
-
-    # 2. keyword map
-    keyword_map = {
-        "Insurance Provider": ["insurance", "provider"],
-        "Medical Condition": ["condition", "asthma", "flu", "covid", "diabetes", "arthritis", "hypertension"],
-        "Billing Amount": ["billing", "amount", "charge", "cost", "payment", "price"],
-        "Gender": ["male", "female", "gender"],
-        "Age": ["age", "older", "younger"],
-        "Admission Type": ["emergency", "routine", "referral"],
-        "Blood Type": ["blood", "blood type"],
-        "Doctor": ["doctor", "dr"],
-        "Medication": ["medication", "drug", "treatment"],
-        "Test Result": ["positive", "negative", "test"],
-        "Hospital": ["hospital", "clinic"],
-        "Room Number": ["room"]
-    }
-
-    for col, keys in keyword_map.items():
-        if any(k in q for k in keys):
-            return [col]
-
-    # 3. fuzzy fallback
-    names = [c.lower() for c in cols]
-    best = fz.extractOne(q, names)
-    if best and best[1] >= 80:
-        return [cols[best[2]]]
-
-    return []
+def get_intent(text: str) -> str:
+    return clf(text)[0]["label"]
 
 
-# =============================================================================
-# MULTIPLE CATEGORICAL MATCHES + OR LOGIC
-# =============================================================================
+# =====================================================================
+# RULE DICTIONARIES
+# =====================================================================
 
-def detect_value_matches(q):
+# mapping from (column, canonical value) -> keywords to detect it
+SIMPLE_VALUE_RULES = [
+    # Gender
+    {"col": "Gender", "val": "female", "kw": ["female", "woman", "women", "lady", "ladies"]},
+    {"col": "Gender", "val": "male", "kw": ["male", "man", "men", "gentleman", "gentlemen"]},
+
+    # Test result
+    {"col": "Test Result", "val": "positive", "kw": ["tested positive", "test positive", "positive"]},
+    {"col": "Test Result", "val": "negative", "kw": ["tested negative", "test negative", "negative"]},
+
+    # Admission type
+    {"col": "Admission Type", "val": "emergency", "kw": ["emergency", "er"]},
+    {"col": "Admission Type", "val": "routine", "kw": ["routine", "scheduled"]},
+    {"col": "Admission Type", "val": "referral", "kw": ["referral", "referred"]},
+
+    # Medical conditions (add more if your data has them)
+    {"col": "Medical Condition", "val": "asthma", "kw": ["asthma"]},
+    {"col": "Medical Condition", "val": "flu", "kw": ["flu", "influenza"]},
+    {"col": "Medical Condition", "val": "covid", "kw": ["covid", "covid-19", "corona"]},
+    {"col": "Medical Condition", "val": "diabetes", "kw": ["diabetes", "diabetic"]},
+    {"col": "Medical Condition", "val": "hypertension", "kw": ["hypertension", "high blood pressure"]},
+    {"col": "Medical Condition", "val": "arthritis", "kw": ["arthritis"]},
+
+    # Blood type
+    {"col": "Blood Type", "val": "o+", "kw": ["o+", "o positive"]},
+    {"col": "Blood Type", "val": "o-", "kw": ["o-", "o negative"]},
+    {"col": "Blood Type", "val": "a+", "kw": ["a+", "a positive"]},
+    {"col": "Blood Type", "val": "a-", "kw": ["a-", "a negative"]},
+    {"col": "Blood Type", "val": "b+", "kw": ["b+", "b positive"]},
+    {"col": "Blood Type", "val": "b-", "kw": ["b-", "b negative"]},
+    {"col": "Blood Type", "val": "ab+", "kw": ["ab+", "ab positive"]},
+    {"col": "Blood Type", "val": "ab-", "kw": ["ab-", "ab negative"]},
+
+    # Insurance provider (example names)
+    {"col": "Insurance Provider", "val": "aetna", "kw": ["aetna"]},
+    {"col": "Insurance Provider", "val": "cigna", "kw": ["cigna"]},
+    {"col": "Insurance Provider", "val": "blue cross", "kw": ["blue cross", "bluecross"]},
+    {"col": "Insurance Provider", "val": "united", "kw": ["united", "uhc", "united healthcare"]},
+]
+
+# group-by synonym map for aggregate / compare
+GROUP_SYNONYMS = {
+    "Insurance Provider": ["insurance provider", "insurer", "provider"],
+    "Admission Type": ["admission type", "admission", "type of admission"],
+    "Gender": ["gender", "sex"],
+    "Blood Type": ["blood type", "blood group"],
+    "Medical Condition": ["medical condition", "condition", "disease", "diagnosis"],
+    "Hospital": ["hospital", "clinic"],
+    "Test Result": ["test result", "result"],
+    "Medication": ["medication", "drug", "treatment"],
+}
+
+
+# =====================================================================
+# CATEGORICAL FILTERS
+# =====================================================================
+
+def extract_simple_categorical_filters(query: str):
     """
-    Returns dict like:
-    {
-       "Medical Condition": ["asthma", "flu"],
-       "Test Result": ["positive"]
-    }
-    Supports OR-logic.
+    Returns dict: col -> set(values)
+    based purely on keyword rules above.
     """
-    ql = q.lower()
-    matches = {}
+    ql = query.lower()
+    filters = {}
 
-    # Special blood type detection
-    bloods = ["a+", "a-", "b+", "b-", "o+", "o-", "ab+", "ab-"]
-    merged = ql.replace(" ", "")
-    for b in bloods:
-        if b in merged:
-            if "Blood Type" in df.columns:
-                matches.setdefault("Blood Type", []).append(b)
+    for rule in SIMPLE_VALUE_RULES:
+        col, val, kws = rule["col"], rule["val"], rule["kw"]
 
-    # Explicit test result detection
-    if "positive" in ql:
-        matches.setdefault("Test Result", []).append("positive")
-    if "negative" in ql:
-        matches.setdefault("Test Result", []).append("negative")
+        if col not in df.columns:
+            continue
 
-    # OR-split logic
-    parts = re.split(r"\bor\b", ql)
+        if any(k in ql for k in kws):
+            filters.setdefault(col, set()).add(val)
 
-    for chunk in parts:
-        chunk = chunk.strip()
-        for col in df.columns:
-            if df[col].dtype == object and df[col].nunique() <= 300:
-                vals = [str(v).lower() for v in df[col].dropna().unique()]
-                m = fz.extractOne(chunk, vals, score_cutoff=90)
-                if m:
-                    matches.setdefault(col, []).append(m[0])
-
-    return matches
+    return filters
 
 
+# =====================================================================
+# NUMERIC FILTERS (AGE, BILLING)
+# =====================================================================
 
-# =============================================================================
-# NUMERIC FILTERS (NO K-PARSING)
-# =============================================================================
-
-def extract_numeric_filters(q):
+def extract_numeric_filters(query: str):
     """
-    Handles:
-        age under 80
-        billing less than 12000
-        age over 60
-        billing above 20000
+    Build numeric conditions for Age and Billing Amount.
+
+    Handles patterns like:
+      - over 40
+      - over age 60
+      - older than 65
+      - under 30
+      - younger than 25
+      - billing over 20000
+      - billing amount less than 12000
     """
-    ql = q.lower().replace("$", "").replace(",", "")
+    ql = query.lower().replace("$", "").replace(",", "")
     conds = []
 
-    # Age
-    if "age" in ql or "years old" in ql:
-        m_under = re.search(r"(under|less than|below)\s+(\d+)", ql)
-        m_over = re.search(r"(over|greater than|above)\s+(\d+)", ql)
-        if m_under:
-            conds.append(f"`Age` < {int(m_under.group(2))}")
-        if m_over:
-            conds.append(f"`Age` > {int(m_over.group(2))}")
+    has_age_col = "Age" in df.columns
+    has_bill_col = "Billing Amount" in df.columns
 
-    # Billing
-    if any(x in ql for x in ["billing", "charge", "payment", "amount", "price", "cost"]):
-        m_under = re.search(r"(under|less than|below)\s+(\d+)", ql)
-        m_over = re.search(r"(over|greater than|above)\s+(\d+)", ql)
-        if m_under:
-            conds.append(f"`Billing Amount` < {int(m_under.group(2))}")
-        if m_over:
-            conds.append(f"`Billing Amount` > {int(m_over.group(2))}")
+    # Helper: generic window around match to decide if it is billing-related
+    billing_words = ["billing", "amount", "cost", "charge", "payment", "price"]
 
+    # 1. explicit "older than/younger than"
+    if has_age_col:
+        for m in re.finditer(r"(older than|greater than)\s+(\d+)", ql):
+            num = int(m.group(2))
+            conds.append(f"`Age` > {num}")
+        for m in re.finditer(r"(younger than|less than|under)\s+(\d+)", ql):
+            num = int(m.group(2))
+            conds.append(f"`Age` < {num}")
+
+        # patterns with "age" word
+        for m in re.finditer(r"(over|above)\s+age\s+(\d+)", ql):
+            num = int(m.group(2))
+            conds.append(f"`Age` > {num}")
+        for m in re.finditer(r"(under|below)\s+age\s+(\d+)", ql):
+            num = int(m.group(2))
+            conds.append(f"`Age` < {num}")
+
+    # 2. generic "over 40", "under 30"
+    for m in re.finditer(r"(over|above|greater than|under|below|less than)\s+(\d+)", ql):
+        op_word, num_str = m.groups()
+        num = int(num_str)
+        op = ">" if op_word in ["over", "above", "greater than"] else "<"
+
+        start, end = m.span()
+        window_start = max(0, start - 25)
+        window_end = min(len(ql), end + 25)
+        window = ql[window_start:window_end]
+
+        # If billing words appear near, treat as billing
+        if any(w in window for w in billing_words) and has_bill_col:
+            conds.append(f"`Billing Amount` {op} {num}")
+        # otherwise, if we have Age column, treat as age
+        elif has_age_col:
+            conds.append(f"`Age` {op} {num}")
+
+    # 3. explicit billing patterns
+    if has_bill_col:
+        for m in re.finditer(
+            r"(billing amount|billing|amount|cost|charge|payment)\s+(over|above|greater than|under|below|less than)\s+(\d+)",
+            ql,
+        ):
+            _, op_word, num_str = m.groups()
+            num = int(num_str)
+            op = ">" if op_word in ["over", "above", "greater than"] else "<"
+            conds.append(f"`Billing Amount` {op} {num}")
+
+    # deduplicate
+    conds = list(dict.fromkeys(conds))
     return conds
 
 
+# =====================================================================
+# DATE FILTERS (simple)
+# =====================================================================
 
-# =============================================================================
-# DATE RANGE DETECTION
-# =============================================================================
-
-def parse_dates(q):
-    q = q.lower()
+def parse_date_range(query: str):
+    q = query.lower()
     today = date.today()
 
     if "last year" in q:
         return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
-
-    if "last 30 days" in q:
-        return today - timedelta(days=30), today
 
     if "last month" in q:
         end = today.replace(day=1) - timedelta(days=1)
         start = end.replace(day=1)
         return start, end
 
+    if "last 30 days" in q:
+        return today - timedelta(days=30), today
+
     return None, None
 
 
-# =============================================================================
-# COMPARISON TARGET DETECTION
-# =============================================================================
-
-def detect_comparison_target(q):
-    q = q.lower()
-    compare_map = {
-        "Gender": ["gender", "male", "female"],
-        "Blood Type": ["blood", "blood type", "a+", "o+", "ab+", "b-"],
-        "Medical Condition": ["condition", "asthma", "flu", "covid", "diabetes", "arthritis", "hypertension"],
-        "Admission Type": ["admission", "emergency", "routine", "referral"],
-        "Hospital": ["hospital", "clinic"],
-        "Insurance Provider": ["aetna", "cigna", "insurance", "provider"],
-        "Doctor": ["doctor", "dr"],
-        "Medication": ["medication", "drug", "treatment"],
-        "Test Result": ["positive", "negative", "test"],
-    }
-    for col, keys in compare_map.items():
-        if any(k in q for k in keys):
-            return col
+def pick_date_column():
+    for c in df.columns:
+        if "date" in c.lower():
+            return c
     return None
 
 
-# =============================================================================
-# INTENT
-# =============================================================================
+# =====================================================================
+# GROUP BY COLUMN DETECTION (for aggregate / compare)
+# =====================================================================
 
-def get_intent(q):
-    return clf(q)[0]["label"]
+def detect_group_column(query: str):
+    ql = query.lower()
+
+    # Prefer phrase after "by ...".
+    m = re.search(r"\bby ([a-z ]+)", ql)
+    phrase = None
+    if m:
+        phrase = m.group(1)
+        # cut at "for", "with", "who", "that"
+        phrase = re.split(r"\b(for|with|who|that|where)\b", phrase)[0].strip()
+
+    # If we have a phrase, use it; otherwise use full query
+    candidate_texts = [phrase] if phrase else []
+    candidate_texts.append(ql)
+
+    for text in candidate_texts:
+        for col, variants in GROUP_SYNONYMS.items():
+            if col in df.columns and any(v in text for v in variants):
+                return col
+
+    # fallback heuristics
+    if "Insurance Provider" in df.columns:
+        return "Insurance Provider"
+    if "Medical Condition" in df.columns:
+        return "Medical Condition"
+    if "Admission Type" in df.columns:
+        return "Admission Type"
+    if "Gender" in df.columns:
+        return "Gender"
+
+    # last fallback: first non-numeric column
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            return c
+    return df.columns[0]
 
 
-# =============================================================================
-# SQL BUILDER WITH OR-LOGIC + NUMERIC FIX
-# =============================================================================
+# =====================================================================
+# WHERE CLAUSE BUILDER
+# =====================================================================
 
-def build_sql(query):
-    q = query.lower()
-    intent = get_intent(query)
+def build_where_clauses(query: str):
+    clauses = []
 
-    value_matches = detect_value_matches(query)
-    numeric_filters = extract_numeric_filters(query)
-    start, end = parse_dates(query)
-    cols = extract_columns(query)
-
-    # Build WHERE
-    where = []
-
-    # OR logic for categorical filters
-    for col, vals in value_matches.items():
+    # categorical
+    cat_filters = extract_simple_categorical_filters(query)
+    for col, vals in cat_filters.items():
         if len(vals) == 1:
-            where.append(f"LOWER(`{col}`) = LOWER('{vals[0]}')")
+            val = list(vals)[0]
+            clauses.append(f"LOWER(`{col}`) = LOWER('{val}')")
         else:
-            ors = " OR ".join([f"LOWER(`{col}`)=LOWER('{v}')" for v in vals])
-            where.append("(" + ors + ")")
+            parts = [f"LOWER(`{col}`) = LOWER('{v}')" for v in vals]
+            clauses.append("(" + " OR ".join(parts) + ")")
 
-    # Numeric
-    for cond in numeric_filters:
-        where.append(cond)
+    # numeric
+    clauses.extend(extract_numeric_filters(query))
 
-    # Date
+    # date ranges
+    start, end = parse_date_range(query)
     if start and end:
-        for col in df.columns:
-            if "date" in col.lower():
-                where.append(f"date(`{col}`) BETWEEN date('{start}') AND date('{end}')")
+        date_col = pick_date_column()
+        if date_col:
+            clauses.append(f"date(`{date_col}`) BETWEEN date('{start}') AND date('{end}')")
 
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    return clauses
 
-    # INTENT HANDLING
+
+# =====================================================================
+# SQL BUILDER
+# =====================================================================
+
+def build_sql(query: str):
+    intent = get_intent(query)
+    ql = query.lower()
+
+    where_clauses = build_where_clauses(query)
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    # FILTER
     if intent == "filter":
-        return intent, f"SELECT * FROM data {where_sql} LIMIT 200;"
+        sql = f"SELECT * FROM data {where_sql} LIMIT 200;"
+        return intent, sql
 
+    # COUNT
     if intent == "count":
-        return intent, f"SELECT COUNT(*) AS total FROM data {where_sql};"
+        sql = f"SELECT COUNT(*) AS value FROM data {where_sql};"
+        return intent, sql
 
-    if intent == "aggregate":
-        group_col = cols[0] if cols else "Insurance Provider"
-        return (
-            intent,
-            f"""
-            SELECT `{group_col}`, AVG(`Billing Amount`) AS value
-            FROM data
-            {where_sql}
-            GROUP BY `{group_col}`
-            ORDER BY value DESC;
-            """
-        )
+    # AGGREGATE / COMPARE (both return category + value)
+    if intent in ["aggregate", "compare"]:
+        group_col = detect_group_column(query)
 
-    if intent == "compare":
-        group_col = detect_comparison_target(query) or (cols[0] if cols else "Gender")
-        metric = "AVG(`Billing Amount`)" if any(x in q for x in ["billing", "amount", "cost", "price"]) else "COUNT(*)"
-        return (
-            intent,
-            f"""
-            SELECT `{group_col}`, {metric} AS value
-            FROM data
-            {where_sql}
-            GROUP BY `{group_col}`
-            ORDER BY value DESC;
-            """
-        )
+        # decide metric
+        if any(w in ql for w in ["number of", "count of", "how many", "count"]):
+            metric = "COUNT(*)"
+        elif "Billing Amount" in df.columns and any(w in ql for w in ["billing", "amount", "cost", "price", "charge"]):
+            metric = "AVG(`Billing Amount`)"
+        elif "Billing Amount" in df.columns:
+            metric = "AVG(`Billing Amount`)"
+        else:
+            metric = "COUNT(*)"
 
+        sql = f"""
+        SELECT `{group_col}` AS category,
+               {metric} AS value
+        FROM data
+        {where_sql}
+        GROUP BY `{group_col}`
+        ORDER BY value DESC;
+        """
+        return intent, sql
+
+    # TREND
     if intent == "trend":
-        date_col = next((c for c in df.columns if "date" in c.lower()), df.columns[0])
-        return (
-            intent,
-            f"""
-            SELECT `{date_col}` AS dt, COUNT(*) AS value
-            FROM data
-            GROUP BY dt
-            ORDER BY dt;
-            """
-        )
+        date_col = pick_date_column() or df.columns[0]
+        sql = f"""
+        SELECT `{date_col}` AS dt,
+               COUNT(*) AS value
+        FROM data
+        {where_sql}
+        GROUP BY dt
+        ORDER BY dt;
+        """
+        return intent, sql
 
-    return intent, "SELECT * FROM data LIMIT 100;"
+    # fallback
+    sql = "SELECT * FROM data LIMIT 100;"
+    return intent, sql
 
 
-# =============================================================================
-# DRILL-DOWN FILTERS
-# =============================================================================
+# =====================================================================
+# DRILLDOWN FILTERING
+# =====================================================================
 
-def apply_drill_filters(result):
-    st.subheader("🔍 Drill-Down Filters")
+def apply_drilldown_filters(result: pd.DataFrame) -> pd.DataFrame:
+    st.subheader("Interactive filters")
     filtered = result.copy()
 
     for col in result.columns:
         if col not in ["value", "dt"]:
-            vals = sorted(list(filtered[col].dropna().unique()))
-            if len(vals) > 1:
-                choose = st.multiselect(f"Filter by {col}", vals)
-                if choose:
-                    filtered = filtered[filtered[col].isin(choose)]
+            unique_vals = sorted(list(filtered[col].dropna().unique()))
+            if 1 < len(unique_vals) <= 50:
+                selected = st.multiselect(f"Filter by {col}", unique_vals)
+                if selected:
+                    filtered = filtered[filtered[col].isin(selected)]
     return filtered
 
 
-# =============================================================================
+# =====================================================================
 # VISUALIZATION
-# =============================================================================
+# =====================================================================
 
-def visualize(intent, result):
+def visualize(intent: str, result: pd.DataFrame):
     if result.empty:
-        st.warning("⚠ No results found")
+        st.warning("No data returned for this query.")
         return
 
-    # DRILL DOWN
-    result = apply_drill_filters(result)
+    has_value_col = "value" in result.columns
 
-    group_col = next((c for c in result.columns if c not in ["value", "dt"]), None)
+    # Apply drilldown filters first
+    result = apply_drilldown_filters(result)
 
-    st.subheader("📊 Visualization Options")
-    chart = st.selectbox("Choose a chart type:", ["Bar Chart", "Pie Chart", "Line Chart", "Table Only"])
+    # FILTER / COUNT: table only
+    if intent == "filter" or not has_value_col:
+        st.subheader("Table result")
+        st.dataframe(result)
+        return
 
-    # LINE CHART
-    if chart == "Line Chart":
-        if "dt" not in result.columns:
-            st.error("❌ No date column available for trend plot.")
+    st.subheader("Chart options")
+    chart_type = st.selectbox("Choose chart type", ["Bar", "Pie", "Line", "Table only"])
+
+    # category / dt detection
+    category_col = "category" if "category" in result.columns else None
+    date_col = "dt" if "dt" in result.columns else None
+
+    if chart_type == "Line":
+        if date_col not in result.columns:
+            st.error("No date column available for a line chart.")
         else:
-            result["dt"] = pd.to_datetime(result["dt"], errors="coerce")
-            fig, ax = plt.subplots(figsize=(10,4))
-            sns.lineplot(data=result, x="dt", y="value", marker="o")
+            result[date_col] = pd.to_datetime(result[date_col], errors="coerce")
+            fig, ax = plt.subplots(figsize=(10, 4))
+            sns.lineplot(data=result, x=date_col, y="value", marker="o")
             plt.xticks(rotation=45)
+            plt.tight_layout()
             st.pyplot(fig)
 
-    # BAR CHART
-    elif chart == "Bar Chart" and group_col:
-        fig, ax = plt.subplots(figsize=(10,4))
-        sns.barplot(data=result, x=group_col, y="value", palette="Blues_d")
+    elif chart_type == "Bar" and category_col:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        sns.barplot(data=result, x=category_col, y="value", ax=ax)
         plt.xticks(rotation=45)
-        # Labels
+        # bar labels
         for i, v in enumerate(result["value"]):
-            ax.text(i, v + max(result["value"])*0.02, str(v), ha="center")
+            ax.text(i, v, str(v), ha="center", va="bottom")
         plt.tight_layout()
         st.pyplot(fig)
 
-    # PIE CHART
-    elif chart == "Pie Chart" and group_col:
-        fig, ax = plt.subplots(figsize=(8,8))
-        ax.pie(result["value"], labels=result[group_col], autopct="%1.1f%%")
+    elif chart_type == "Pie" and category_col:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.pie(result["value"], labels=result[category_col], autopct="%1.1f%%")
         st.pyplot(fig)
 
-    # TABLE
-    st.subheader("📋 Table Result")
+    # table always
+    st.subheader("Table")
     st.dataframe(result)
 
-    # INSIGHTS
-    st.subheader("🧠 Insights")
+    # simple insights
+    st.subheader("Insights")
     try:
-        if intent in ["aggregate", "compare"] and group_col:
-            idx_hi = result["value"].idxmax()
-            idx_lo = result["value"].idxmin()
-            hi_cat = result.loc[idx_hi, group_col]
-            lo_cat = result.loc[idx_lo, group_col]
-            st.write(f"• **Highest:** {hi_cat} → {result['value'][idx_hi]}")
-            st.write(f"• **Lowest:** {lo_cat} → {result['value'][idx_lo]}")
-        elif intent == "trend":
-            if result["value"].iloc[-1] > result["value"].iloc[0]:
-                st.write("📈 Upward trend detected.")
-            else:
-                st.write("📉 Downward trend detected.")
-    except:
-        st.write("ℹ No insights available.")
+        idx_max = result["value"].idxmax()
+        idx_min = result["value"].idxmin()
+        if category_col:
+            st.write(f"Highest: {result.loc[idx_max, category_col]} = {result.loc[idx_max, 'value']}")
+            st.write(f"Lowest: {result.loc[idx_min, category_col]} = {result.loc[idx_min, 'value']}")
+        else:
+            st.write("Summary statistics:")
+            st.write(result["value"].describe())
+    except Exception:
+        st.write("No insights available.")
 
 
-# =============================================================================
-# MAIN QUERY BOX
-# =============================================================================
+# =====================================================================
+# MAIN UI
+# =====================================================================
 
-query = st.text_input("💬 Ask a question about your data:")
+query = st.text_input("Ask a question about your data:")
 
 if query:
     intent, sql = build_sql(query)
-    st.info(f"🎯 Intent detected: **{intent}**")
+    st.write(f"Detected intent: {intent}")
     st.code(sql, language="sql")
 
     try:
         result_df = pd.read_sql_query(sql, conn)
         visualize(intent, result_df)
     except Exception as e:
-        st.error(f"SQL Error: {e}")
+        st.error(f"SQL execution error: {e}")
