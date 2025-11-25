@@ -39,6 +39,7 @@ st.dataframe(df.head())
 
 try:
     clf = pipeline("text-classification", model="intent_model", tokenizer="intent_model")
+    st.success("Loaded intent classification model.")
 except Exception as e:
     st.error(f"Could not load intent_model. Error: {e}")
     st.stop()
@@ -92,6 +93,16 @@ SIMPLE_VALUE_RULES = [
     {"col": "Insurance Provider", "val": "united", "kw": ["united", "uhc", "united healthcare"]},
 ]
 
+COLUMN_KEYWORDS = {
+    "gender": ["gender", "male", "female"],
+    "age": ["age", "older", "younger", "over", "under"],
+    "medical condition": ["asthma", "flu", "covid", "hypertension", "diabetes"],
+    "admission type": ["emergency", "urgent", "elective"],
+    "insurance provider": ["insurance"],
+    "billing amount": ["billing", "amount", "payment", "cost", "charge", "expenses"],
+    "blood type": ["blood", "o+", "o-", "a+", "a-", "b+", "b-", "ab+", "ab-"],
+}
+
 # group-by synonym map for aggregate / compare
 GROUP_SYNONYMS = {
     "Insurance Provider": ["insurance provider", "insurer", "provider"],
@@ -108,13 +119,15 @@ GROUP_SYNONYMS = {
 # =====================================================================
 # CATEGORICAL FILTERS
 # =====================================================================
-
 def extract_simple_categorical_filters(query: str):
     """
-    Returns dict: col -> set(values)
-    based purely on keyword rules above.
+    SAFER version — uses strict word boundaries.
+    Prevents accidental matches like adding 'emergency'
+    when user did NOT say emergency.
     """
+
     ql = query.lower()
+    words = set(re.findall(r"\b[a-z0-9+\-]+\b", ql))  # exact word list
     filters = {}
 
     for rule in SIMPLE_VALUE_RULES:
@@ -123,11 +136,11 @@ def extract_simple_categorical_filters(query: str):
         if col not in df.columns:
             continue
 
-        if any(k in ql for k in kws):
+        # strict match: keyword must be a complete word
+        if any(k.lower() in words for k in kws):
             filters.setdefault(col, set()).add(val)
 
     return filters
-
 
 # =====================================================================
 # NUMERIC FILTERS (AGE, BILLING)
@@ -279,12 +292,12 @@ def detect_group_column(query: str):
 # =====================================================================
 # WHERE CLAUSE BUILDER
 # =====================================================================
-
 def build_where_clauses(query: str):
     clauses = []
 
-    # categorical
+    # 1. Strict categorical filters
     cat_filters = extract_simple_categorical_filters(query)
+
     for col, vals in cat_filters.items():
         if len(vals) == 1:
             val = list(vals)[0]
@@ -293,54 +306,69 @@ def build_where_clauses(query: str):
             parts = [f"LOWER(`{col}`) = LOWER('{v}')" for v in vals]
             clauses.append("(" + " OR ".join(parts) + ")")
 
-    # numeric
+    # 2. Numeric filters (already safe)
     clauses.extend(extract_numeric_filters(query))
 
-    # date ranges
+    # 3. Date range support
     start, end = parse_date_range(query)
     if start and end:
         date_col = pick_date_column()
         if date_col:
-            clauses.append(f"date(`{date_col}`) BETWEEN date('{start}') AND date('{end}')")
+            clauses.append(
+                f"date(`{date_col}`) BETWEEN date('{start}') AND date('{end}')"
+            )
 
     return clauses
-
 
 # =====================================================================
 # SQL BUILDER
 # =====================================================================
-
 def build_sql(query: str):
     intent = get_intent(query)
     ql = query.lower()
 
+    # ------------------------------------------------------------------
+    # 1. Build WHERE clause from clean filters only
+    # ------------------------------------------------------------------
     where_clauses = build_where_clauses(query)
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-    # FILTER
+    # ------------------------------------------------------------------
+    # 2. FILTER → simple return
+    # ------------------------------------------------------------------
     if intent == "filter":
-        sql = f"SELECT * FROM data {where_sql} LIMIT 200;"
-        return intent, sql
+        return intent, f"SELECT * FROM data {where_sql} LIMIT 200;"
 
-    # COUNT
+    # ------------------------------------------------------------------
+    # 3. COUNT
+    # ------------------------------------------------------------------
     if intent == "count":
-        sql = f"SELECT COUNT(*) AS value FROM data {where_sql};"
-        return intent, sql
+        return intent, f"SELECT COUNT(*) AS value FROM data {where_sql};"
 
-    # AGGREGATE / COMPARE (both return category + value)
+    # ------------------------------------------------------------------
+    # 4. AGGREGATE / COMPARE
+    # ------------------------------------------------------------------
     if intent in ["aggregate", "compare"]:
+
+        # --------------------------------------------------------------
+        # A. Detect group column based ONLY on "by X" or synonyms
+        # --------------------------------------------------------------
         group_col = detect_group_column(query)
 
-        # decide metric
-        if any(w in ql for w in ["number of", "count of", "how many", "count"]):
+        # --------------------------------------------------------------
+        # B. Metric Selection (clean)
+        # --------------------------------------------------------------
+        if any(w in ql for w in ["how many", "count of", "number of", "count "]):
             metric = "COUNT(*)"
-        elif "Billing Amount" in df.columns and any(w in ql for w in ["billing", "amount", "cost", "price", "charge"]):
-            metric = "AVG(`Billing Amount`)"
-        elif "Billing Amount" in df.columns:
+        elif "billing amount" in df.columns and any(w in ql for w in 
+                ["billing", "amount", "cost", "price", "charge"]):
             metric = "AVG(`Billing Amount`)"
         else:
             metric = "COUNT(*)"
 
+        # --------------------------------------------------------------
+        # C. Final SQL (no default categories added ever)
+        # --------------------------------------------------------------
         sql = f"""
         SELECT `{group_col}` AS category,
                {metric} AS value
@@ -351,7 +379,9 @@ def build_sql(query: str):
         """
         return intent, sql
 
-    # TREND
+    # ------------------------------------------------------------------
+    # 5. TREND (time series)
+    # ------------------------------------------------------------------
     if intent == "trend":
         date_col = pick_date_column() or df.columns[0]
         sql = f"""
@@ -364,31 +394,13 @@ def build_sql(query: str):
         """
         return intent, sql
 
-    # fallback
-    sql = "SELECT * FROM data LIMIT 100;"
-    return intent, sql
-
-
-# =====================================================================
-# DRILLDOWN FILTERING
-# =====================================================================
-
-def apply_drilldown_filters(result: pd.DataFrame) -> pd.DataFrame:
-    st.subheader("Interactive filters")
-    filtered = result.copy()
-
-    for col in result.columns:
-        if col not in ["value", "dt"]:
-            unique_vals = sorted(list(filtered[col].dropna().unique()))
-            if 1 < len(unique_vals) <= 50:
-                selected = st.multiselect(f"Filter by {col}", unique_vals)
-                if selected:
-                    filtered = filtered[filtered[col].isin(selected)]
-    return filtered
-
+    # ------------------------------------------------------------------
+    # 6. Fallback
+    # ------------------------------------------------------------------
+    return intent, "SELECT * FROM data LIMIT 100;"
 
 # =====================================================================
-# VISUALIZATION
+# VISUALIZATION (FINAL FIX)
 # =====================================================================
 
 def visualize(intent: str, result: pd.DataFrame):
@@ -396,68 +408,103 @@ def visualize(intent: str, result: pd.DataFrame):
         st.warning("No data returned for this query.")
         return
 
-    has_value_col = "value" in result.columns
+    # Detect columns
+    category_col = None
+    value_col = None
 
-    # Apply drilldown filters first
-    result = apply_drilldown_filters(result)
+    for c in result.columns:
+        if c.lower() in ["category", "group", "type"]:
+            category_col = c
+        if c.lower() in ["value", "count", "avg", "total"]:
+            value_col = c
 
-    # FILTER / COUNT: table only
-    if intent == "filter" or not has_value_col:
-        st.subheader("Table result")
+    if category_col is None or value_col is None:
+        st.subheader("Table Result")
         st.dataframe(result)
         return
 
-    st.subheader("Chart options")
-    chart_type = st.selectbox("Choose chart type", ["Bar", "Pie", "Line", "Table only"])
+    # =======================================================
+    # Chart size selector
+    # =======================================================
+    size_option = st.selectbox("Chart Size", ["Small", "Medium", "Large"], index=0)
 
-    # category / dt detection
-    category_col = "category" if "category" in result.columns else None
-    date_col = "dt" if "dt" in result.columns else None
+    size_map = {
+        "Small": (6, 3),
+        "Medium": (10, 4),
+        "Large": (14, 6),
+    }
+    fig_w, fig_h = size_map[size_option]
 
-    if chart_type == "Line":
-        if date_col not in result.columns:
-            st.error("No date column available for a line chart.")
-        else:
-            result[date_col] = pd.to_datetime(result[date_col], errors="coerce")
-            fig, ax = plt.subplots(figsize=(10, 4))
-            sns.lineplot(data=result, x=date_col, y="value", marker="o")
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            st.pyplot(fig)
+    # =======================================================
+    # Chart type selector
+    # =======================================================
+    chart_type = st.selectbox("Chart Type", ["Bar", "Pie", "Line", "Table only"], index=0)
 
-    elif chart_type == "Bar" and category_col:
-        fig, ax = plt.subplots(figsize=(10, 4))
-        sns.barplot(data=result, x=category_col, y="value", ax=ax)
-        plt.xticks(rotation=45)
-        # bar labels
-        for i, v in enumerate(result["value"]):
-            ax.text(i, v, str(v), ha="center", va="bottom")
+    st.subheader("Comparison")
+
+    # =======================================================
+    # BAR CHART
+    # =======================================================
+    if chart_type == "Bar":
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+        sns.barplot(data=result, x=category_col, y=value_col, ax=ax)
+
+        # Add bar labels ABOVE the bars
+        for i, v in enumerate(result[value_col]):
+            ax.text(i, v + (max(result[value_col]) * 0.03),     # above bar
+                    f"{v:.0f}",
+                    ha="center",
+                    fontsize=10,
+                    fontweight="bold")
+
+        ax.set_xlabel(category_col, fontsize=12)
+        ax.set_ylabel(value_col, fontsize=12)
+        plt.xticks(rotation=20)
         plt.tight_layout()
         st.pyplot(fig)
 
-    elif chart_type == "Pie" and category_col:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        ax.pie(result["value"], labels=result[category_col], autopct="%1.1f%%")
+    # =======================================================
+    # PIE CHART
+    # =======================================================
+    elif chart_type == "Pie":
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.pie(result[value_col], labels=result[category_col], autopct='%1.1f%%')
         st.pyplot(fig)
 
-    # table always
-    st.subheader("Table")
+    # =======================================================
+    # LINE CHART
+    # =======================================================
+    elif chart_type == "Line":
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        sns.lineplot(data=result, x=category_col, y=value_col, marker="o", ax=ax)
+
+        ax.set_xlabel(category_col, fontsize=12)
+        ax.set_ylabel(value_col, fontsize=12)
+        plt.xticks(rotation=20)
+        plt.tight_layout()
+        st.pyplot(fig)
+
+    # =======================================================
+    # TABLE ONLY
+    # =======================================================
+    st.subheader("Table Result")
     st.dataframe(result)
 
-    # simple insights
+    # =======================================================
+    # Insights
+    # =======================================================
     st.subheader("Insights")
+
     try:
-        idx_max = result["value"].idxmax()
-        idx_min = result["value"].idxmin()
-        if category_col:
-            st.write(f"Highest: {result.loc[idx_max, category_col]} = {result.loc[idx_max, 'value']}")
-            st.write(f"Lowest: {result.loc[idx_min, category_col]} = {result.loc[idx_min, 'value']}")
-        else:
-            st.write("Summary statistics:")
-            st.write(result["value"].describe())
+        idx_max = result[value_col].idxmax()
+        idx_min = result[value_col].idxmin()
+
+        st.write(f"**Highest {value_col}:** {result.loc[idx_max, category_col]} → {result.loc[idx_max, value_col]}")
+        st.write(f"**Lowest {value_col}:** {result.loc[idx_min, category_col]} → {result.loc[idx_min, value_col]}")
+
     except Exception:
         st.write("No insights available.")
-
 
 # =====================================================================
 # MAIN UI
