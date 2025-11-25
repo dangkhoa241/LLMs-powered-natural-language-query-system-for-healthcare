@@ -8,7 +8,7 @@ Unlike typical NL→SQL systems, this project supports a **full workflow**:
 The system contains three major components:
 
 ### 1. **Intent Classification Model**
-- A custom fine-tuned intent classifier (trained using `intent_dataset.csv` & `intent_dataset_1000.csv`)
+- A custom fine-tuned intent classifier (trained using `intent_dataset.csv`)
 - Produces categories such as: *aggregation, comparison, trend, filter, distribution*, etc.
 - Stored in the `intent_model/` folder
 - Used to decide which type of SQL and which chart to generate
