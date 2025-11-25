@@ -34,13 +34,17 @@ The system contains three major components:
 
 ## 📂 What This Project Contains
 data/
+
 healthcare_dataset.csv # The main dataset users will query
+
 intent_dataset.csv # Training data for intent classifier
 
 intent_model/ # Saved intent classification model
 
 src/
+
 app.py # Streamlit app (core user interface)
+
 model_training.ipynb # Notebook for training intent model
 
 logs/ # LLM + model logging
@@ -65,7 +69,7 @@ requirements.txt # Dependencies
 ## 🧠 Example Workflow
 
 **User:**  
-> “Show me the average blood pressure by age group.”
+> “Show emergency cases under age 40 with billing less than 12,000 and blood type O+ or A-”
 
 **System:**
 1. Intent model → **Aggregation + Group-by**
