@@ -34,15 +34,19 @@ The system contains three major components:
 
 ## 📂 What This Project Contains
 data/
-├── healthcare_dataset.csv # The main dataset users will query
-├── intent_dataset.csv # Training data for intent classifier
-├── intent_dataset_1000.csv # Larger intent dataset
+healthcare_dataset.csv # The main dataset users will query
+intent_dataset.csv # Training data for intent classifier
+
 intent_model/ # Saved intent classification model
+
 src/
-├── app.py # Streamlit app (core user interface)
-├── model_training.ipynb # Notebook for training intent model
+app.py # Streamlit app (core user interface)
+model_training.ipynb # Notebook for training intent model
+
 logs/ # LLM + model logging
+
 project_proposal.pdf # Design document
+
 requirements.txt # Dependencies
 
 ---
