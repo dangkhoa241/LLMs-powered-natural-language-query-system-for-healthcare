@@ -139,9 +139,3 @@ The fine-tuned BERT intent model enables:
 streamlit run app.py
 ```
 
----
-
-## 📜 License
-
-MIT License
-Copyright (c) 2025
