@@ -1,0 +1,26 @@
+# --- Core Application ---
+streamlit
+pandas
+numpy
+python-dotenv
+
+# --- Database / Storage ---
+sqlite3-binary
+
+# --- Visualization ---
+matplotlib
+seaborn
+
+# --- LLM / NLP / Intent Classification ---
+transformers
+torch
+sentencepiece
+huggingface-hub
+
+# --- Machine Learning (training notebook) ---
+scikit-learn
+joblib
+
+# --- Notebook Support (model_training.ipynb) ---
+jupyter
+notebook
