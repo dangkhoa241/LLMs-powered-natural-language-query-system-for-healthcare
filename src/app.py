@@ -10,33 +10,30 @@ from datetime import date, timedelta
 st.set_page_config(page_title="Natural Language Healthcare Analytics", layout="wide")
 st.title("Natural Language Healthcare Data Assistant")
 
-# =====================================================================
 # DATA LOADING
-# =====================================================================
-
 uploaded_file = st.file_uploader("Upload your dataset (CSV)", type=["csv"])
 if not uploaded_file:
     st.stop()
 
 df = pd.read_csv(uploaded_file)
 
-# convert likely numeric columns
 for c in df.columns:
     clean = df[c].astype(str).str.replace(r"[,$ ]", "", regex=True)
     if clean.str.fullmatch(r"-?\d+(\.\d+)?").mean() > 0.7:
         df[c] = pd.to_numeric(clean, errors="coerce")
 
-# in-memory SQL
+for c in df.columns:
+    if "date" in c.lower():
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+        df[c] = df[c].dt.strftime("%Y-%m-%d")
+
 conn = sqlite3.connect(":memory:")
 df.to_sql("data", conn, index=False, if_exists="replace")
 
 st.write(f"Loaded {df.shape[0]} rows and {df.shape[1]} columns")
 st.dataframe(df.head())
 
-# =====================================================================
 # INTENT MODEL
-# =====================================================================
-
 try:
     clf = pipeline("text-classification", model="intent_model", tokenizer="intent_model")
     st.success("Loaded intent classification model.")
@@ -44,15 +41,11 @@ except Exception as e:
     st.error(f"Could not load intent_model. Error: {e}")
     st.stop()
 
-
 def get_intent(text: str) -> str:
     return clf(text)[0]["label"]
 
 
-# =====================================================================
 # RULE DICTIONARIES
-# =====================================================================
-
 # mapping from (column, canonical value) -> keywords to detect it
 SIMPLE_VALUE_RULES = [
     # Gender
@@ -64,7 +57,7 @@ SIMPLE_VALUE_RULES = [
     {"col": "Test Result", "val": "negative", "kw": ["tested negative", "test negative", "negative"]},
 
     # Admission type
-    {"col": "Admission Type", "val": "emergency", "kw": ["emergency", "er"]},
+    {"col": "Admission Type", "val": "emergency", "kw": [" emergency ", " emergency,", " emergency.", " emergency?"]},
     {"col": "Admission Type", "val": "routine", "kw": ["routine", "scheduled"]},
     {"col": "Admission Type", "val": "referral", "kw": ["referral", "referred"]},
 
@@ -115,19 +108,9 @@ GROUP_SYNONYMS = {
     "Medication": ["medication", "drug", "treatment"],
 }
 
-
-# =====================================================================
 # CATEGORICAL FILTERS
-# =====================================================================
 def extract_simple_categorical_filters(query: str):
-    """
-    SAFER version — uses strict word boundaries.
-    Prevents accidental matches like adding 'emergency'
-    when user did NOT say emergency.
-    """
-
     ql = query.lower()
-    words = set(re.findall(r"\b[a-z0-9+\-]+\b", ql))  # exact word list
     filters = {}
 
     for rule in SIMPLE_VALUE_RULES:
@@ -136,29 +119,15 @@ def extract_simple_categorical_filters(query: str):
         if col not in df.columns:
             continue
 
-        # strict match: keyword must be a complete word
-        if any(k.lower() in words for k in kws):
-            filters.setdefault(col, set()).add(val)
+        for k in kws:
+            if re.search(rf"\b{k.lower()}\b", ql):
+                filters.setdefault(col, set()).add(val)
 
     return filters
 
-# =====================================================================
 # NUMERIC FILTERS (AGE, BILLING)
-# =====================================================================
-
 def extract_numeric_filters(query: str):
-    """
-    Build numeric conditions for Age and Billing Amount.
 
-    Handles patterns like:
-      - over 40
-      - over age 60
-      - older than 65
-      - under 30
-      - younger than 25
-      - billing over 20000
-      - billing amount less than 12000
-    """
     ql = query.lower().replace("$", "").replace(",", "")
     conds = []
 
@@ -218,14 +187,16 @@ def extract_numeric_filters(query: str):
     conds = list(dict.fromkeys(conds))
     return conds
 
-
-# =====================================================================
 # DATE FILTERS (simple)
-# =====================================================================
-
 def parse_date_range(query: str):
     q = query.lower()
     today = date.today()
+
+    # Specific year detection (e.g., "in 2023")
+    m = re.search(r"\b(20\d{2})\b", q)
+    if m:
+        y = int(m.group(1))
+        return date(y, 1, 1), date(y, 12, 31)
 
     if "last year" in q:
         return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
@@ -240,20 +211,19 @@ def parse_date_range(query: str):
 
     return None, None
 
-
 def pick_date_column():
     for c in df.columns:
         if "date" in c.lower():
             return c
     return None
 
-
-# =====================================================================
 # GROUP BY COLUMN DETECTION (for aggregate / compare)
-# =====================================================================
-
 def detect_group_column(query: str):
     ql = query.lower()
+
+    if any(k in query.lower() for k in ["male", "female", "gender"]):
+        if "Gender" in df.columns:
+            return "Gender"
 
     # Prefer phrase after "by ...".
     m = re.search(r"\bby ([a-z ]+)", ql)
@@ -288,10 +258,7 @@ def detect_group_column(query: str):
             return c
     return df.columns[0]
 
-
-# =====================================================================
 # WHERE CLAUSE BUILDER
-# =====================================================================
 def build_where_clauses(query: str):
     clauses = []
 
@@ -320,196 +287,293 @@ def build_where_clauses(query: str):
 
     return clauses
 
-# =====================================================================
 # SQL BUILDER
-# =====================================================================
 def build_sql(query: str):
     intent = get_intent(query)
     ql = query.lower()
 
-    # ------------------------------------------------------------------
     # 1. Build WHERE clause from clean filters only
-    # ------------------------------------------------------------------
     where_clauses = build_where_clauses(query)
     where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
 
-    # ------------------------------------------------------------------
     # 2. FILTER → simple return
-    # ------------------------------------------------------------------
     if intent == "filter":
         return intent, f"SELECT * FROM data {where_sql} LIMIT 200;"
 
-    # ------------------------------------------------------------------
     # 3. COUNT
-    # ------------------------------------------------------------------
     if intent == "count":
         return intent, f"SELECT COUNT(*) AS value FROM data {where_sql};"
 
-    # ------------------------------------------------------------------
     # 4. AGGREGATE / COMPARE
-    # ------------------------------------------------------------------
     if intent in ["aggregate", "compare"]:
 
-        # --------------------------------------------------------------
-        # A. Detect group column based ONLY on "by X" or synonyms
-        # --------------------------------------------------------------
         group_col = detect_group_column(query)
 
-        # --------------------------------------------------------------
-        # B. Metric Selection (clean)
-        # --------------------------------------------------------------
-        if any(w in ql for w in ["how many", "count of", "number of", "count "]):
-            metric = "COUNT(*)"
-        elif "billing amount" in df.columns and any(w in ql for w in 
-                ["billing", "amount", "cost", "price", "charge"]):
-            metric = "AVG(`Billing Amount`)"
-        else:
-            metric = "COUNT(*)"
+        # CLEAN METRIC DETECTION (QUESTION-DRIVEN, NOT DATA-DRIVEN)
+        # 1. Explicit COUNT intent
+        if any(w in ql for w in ["how many", "count", "number of"]):
+            agg_func = "COUNT"
+            metric_expr = "COUNT(*)"
+            metric_label = "Count"
 
-        # --------------------------------------------------------------
-        # C. Final SQL (no default categories added ever)
-        # --------------------------------------------------------------
+        # 2. Billing / Cost intent → AVG
+        elif any(w in ql for w in ["billing", "amount", "cost", "price", "charge"]):
+            if "Billing Amount" in df.columns:
+                agg_func = "AVG"
+                metric_expr = "AVG(`Billing Amount`)"
+                metric_label = "Average Billing Amount"
+            else:
+                agg_func = "COUNT"
+                metric_expr = "COUNT(*)"
+                metric_label = "Count"
+
+        # 3. Default fallback → COUNT
+        else:
+            agg_func = "COUNT"
+            metric_expr = "COUNT(*)"
+            metric_label = "Count"
+
+        # FINAL SQL
         sql = f"""
         SELECT `{group_col}` AS category,
-               {metric} AS value
+            {metric_expr} AS value
         FROM data
         {where_sql}
         GROUP BY `{group_col}`
         ORDER BY value DESC;
         """
+
         return intent, sql
 
-    # ------------------------------------------------------------------
     # 5. TREND (time series)
-    # ------------------------------------------------------------------
     if intent == "trend":
         date_col = pick_date_column() or df.columns[0]
-        sql = f"""
-        SELECT `{date_col}` AS dt,
-               COUNT(*) AS value
-        FROM data
-        {where_sql}
-        GROUP BY dt
-        ORDER BY dt;
-        """
+        ql = query.lower()
+
+        # GROUP BY YEAR
+        if "by year" in ql:
+            sql = f"""
+            SELECT strftime('%Y', `{date_col}`) AS year,
+                COUNT(*) AS value
+            FROM data
+            {where_sql}
+            GROUP BY year
+            ORDER BY year;
+            """
+
+        # GROUP BY MONTH
+        elif "by month" in ql:
+            sql = f"""
+            SELECT strftime('%Y-%m', `{date_col}`) AS month,
+                COUNT(*) AS value
+            FROM data
+            {where_sql}
+            GROUP BY month
+            ORDER BY month;
+            """
+
+        # DEFAULT: GROUP BY DAY
+        else:
+            sql = f"""
+            SELECT `{date_col}` AS dt,
+                COUNT(*) AS value
+            FROM data
+            {where_sql}
+            GROUP BY dt
+            ORDER BY dt;
+            """
+
         return intent, sql
 
-    # ------------------------------------------------------------------
     # 6. Fallback
-    # ------------------------------------------------------------------
     return intent, "SELECT * FROM data LIMIT 100;"
 
-# =====================================================================
-# VISUALIZATION (FINAL FIX)
-# =====================================================================
-
+# VISUALIZATION
 def visualize(intent: str, result: pd.DataFrame):
     if result.empty:
-        st.warning("No data returned for this query.")
+        st.warning("No data returned.")
         return
 
-    # Detect columns
-    category_col = None
-    value_col = None
+    # Show table first
+    st.subheader("Table Result")
+    st.dataframe(result)
 
-    for c in result.columns:
-        if c.lower() in ["category", "group", "type"]:
-            category_col = c
-        if c.lower() in ["value", "count", "avg", "total"]:
-            value_col = c
+    # BLOCK charts for FILTER
+    if intent == "filter":
+        st.info("Charts are only generated for aggregated or comparison queries.")
+        return
 
-    if category_col is None or value_col is None:
+    # Detect proper plotting columns
+    numeric_cols = result.select_dtypes(include="number").columns.tolist()
+    text_cols = result.select_dtypes(exclude="number").columns.tolist()
+
+    if not numeric_cols or not text_cols:
         st.subheader("Table Result")
         st.dataframe(result)
         return
 
-    # =======================================================
-    # Chart size selector
-    # =======================================================
-    size_option = st.selectbox("Chart Size", ["Small", "Medium", "Large"], index=0)
+    y_col = numeric_cols[0]
+    x_col = text_cols[0]
 
-    size_map = {
-        "Small": (6, 3),
-        "Medium": (10, 4),
-        "Large": (14, 6),
-    }
-    fig_w, fig_h = size_map[size_option]
+    result[x_col] = result[x_col].astype(str)
+    result = result.sort_values(by=x_col)
 
-    # =======================================================
-    # Chart type selector
-    # =======================================================
-    chart_type = st.selectbox("Chart Type", ["Bar", "Pie", "Line", "Table only"], index=0)
+    # STRICT Small Chart Size
+    fig_w, fig_h = (4, 2.5)
 
-    st.subheader("Comparison")
+    # Chart Type Selector
+    chart_type = st.selectbox(
+        "Chart Type", ["Bar", "Pie", "Line", "Table only"], index=0
+    )
 
-    # =======================================================
-    # BAR CHART
-    # =======================================================
+    st.subheader("Visualization")
+
+    # Bar Chart
     if chart_type == "Bar":
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        fig, ax = plt.subplots(figsize=(fig_w * 0.8, fig_h * 0.8))
 
-        sns.barplot(data=result, x=category_col, y=value_col, ax=ax)
+        sns.barplot(data=result, x=x_col, y=y_col, ax=ax)
 
-        # Add bar labels ABOVE the bars
-        for i, v in enumerate(result[value_col]):
-            ax.text(i, v + (max(result[value_col]) * 0.03),     # above bar
-                    f"{v:.0f}",
-                    ha="center",
-                    fontsize=10,
-                    fontweight="bold")
 
-        ax.set_xlabel(category_col, fontsize=12)
-        ax.set_ylabel(value_col, fontsize=12)
-        plt.xticks(rotation=20)
+        # Smart bar labels (small, non-overlapping)
+        max_val = result[y_col].max()
+        offset = max_val * 0.02
+
+        for i, v in enumerate(result[y_col]):
+            ax.text(
+                i,
+                v + offset,
+                f"{v:,.0f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                fontweight="normal"
+            )
+
+        # Semantic label maps
+        X_LABEL_MAP = {
+            "gender": "Gender",
+            "insurance": "Insurance Provider",
+            "admission": "Admission Type",
+            "blood": "Blood Type",
+            "condition": "Medical Condition",
+            "hospital": "Hospital",
+            "medication": "Medication",
+        }
+
+        Y_LABEL_MAP = {
+            "billing": "Cost",
+            "amount":  "Cost",
+            "cost":    "Cost",
+            "charge":  "Cost",
+            "payment": "Cost",
+            "count":   "Count",
+            "number":  "Count",
+            "total":   "Count",
+        }
+
+        query_tokens = set(query.lower().split())
+
+        # X label resolution
+        clean_x = (
+            next(
+                (label for k, label in X_LABEL_MAP.items() if k in query.lower()),
+                x_col.replace("_", " ").title()
+            )
+        )
+
+        # Y label resolution
+        clean_y = (
+            next(
+                (label for k, label in Y_LABEL_MAP.items() if k in query.lower()),
+                y_col.replace("_", " ").title()
+            )
+        )
+
+        ax.set_xlabel(clean_x, fontsize=10)
+        ax.set_ylabel(clean_y, fontsize=10)
+
+
+        # Clean readable title
+        ax.set_title(query.capitalize(), fontsize=11, fontweight="semibold", pad=12)
+
+        # Reduce clutter
+        plt.xticks(rotation=15, fontsize=4)
+        plt.yticks(fontsize=4)
+        sns.despine()
+
         plt.tight_layout()
         st.pyplot(fig)
 
-    # =======================================================
-    # PIE CHART
-    # =======================================================
+    # Pie Chart
     elif chart_type == "Pie":
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        ax.pie(result[value_col], labels=result[category_col], autopct='%1.1f%%')
-        st.pyplot(fig)
+        fig, ax = plt.subplots(figsize=(fig_w * 0.7, fig_h * 0.7))
 
-    # =======================================================
-    # LINE CHART
-    # =======================================================
-    elif chart_type == "Line":
-        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-        sns.lineplot(data=result, x=category_col, y=value_col, marker="o", ax=ax)
+        ax.pie(
+            result[y_col],
+            labels=result[x_col],
+            autopct="%1.1f%%",
+            textprops={"fontsize": 8},
+            startangle=90
+        )
 
-        ax.set_xlabel(category_col, fontsize=12)
-        ax.set_ylabel(value_col, fontsize=12)
-        plt.xticks(rotation=20)
+        ax.set_title(query.capitalize(), fontsize=11, pad=8)
         plt.tight_layout()
         st.pyplot(fig)
 
-    # =======================================================
-    # TABLE ONLY
-    # =======================================================
-    st.subheader("Table Result")
-    st.dataframe(result)
 
-    # =======================================================
+    # Line Chart
+    elif chart_type == "Line":
+        fig, ax = plt.subplots(figsize=(3.2, 1.8))
+
+        sns.lineplot(
+            data=result,
+            x=x_col,
+            y=y_col,
+            marker="o",
+            linewidth=1.2,
+            markersize=4,
+            ax=ax
+        )
+
+        # Clean labels
+        ax.set_xlabel(x_col.replace("_", " ").title(), fontsize=8)
+        ax.set_ylabel(y_col.replace("_", " ").title(), fontsize=8)
+
+        # Small title
+        ax.set_title(query.capitalize(), fontsize=9, pad=5)
+
+        # Prevent zoom exaggeration
+        ymin, ymax = result[y_col].min(), result[y_col].max()
+        pad = (ymax - ymin) * 0.6 if ymax != ymin else 1
+        ax.set_ylim(ymin - pad, ymax + pad)
+
+        plt.xticks(rotation=18, fontsize=7)
+        plt.yticks(fontsize=7)
+        sns.despine()
+
+        plt.tight_layout(pad=0.3)
+
+        st.pyplot(fig, use_container_width=False)
+
     # Insights
-    # =======================================================
     st.subheader("Insights")
-
     try:
-        idx_max = result[value_col].idxmax()
-        idx_min = result[value_col].idxmin()
+        idx_max = result[y_col].idxmax()
+        idx_min = result[y_col].idxmin()
 
-        st.write(f"**Highest {value_col}:** {result.loc[idx_max, category_col]} → {result.loc[idx_max, value_col]}")
-        st.write(f"**Lowest {value_col}:** {result.loc[idx_min, category_col]} → {result.loc[idx_min, value_col]}")
-
+        st.write(
+            f"Highest {y_col}: "
+            f"{result.loc[idx_max, x_col]} → {result.loc[idx_max, y_col]}"
+        )
+        st.write(
+            f"Lowest {y_col}: "
+            f"{result.loc[idx_min, x_col]} → {result.loc[idx_min, y_col]}"
+        )
     except Exception:
         st.write("No insights available.")
 
-# =====================================================================
 # MAIN UI
-# =====================================================================
-
 query = st.text_input("Ask a question about your data:")
 
 if query:
